@@ -694,43 +694,38 @@ impl DeviceRelocation for AddressManager {
                     .map_err(io::Error::other)?;
             }
             PciBarRegionType::Memory32BitRegion | PciBarRegionType::Memory64BitRegion => {
-                let pci_mmio_allocators = if region_type == PciBarRegionType::Memory32BitRegion {
-                    &self.pci_mmio32_allocators
-                } else {
-                    &self.pci_mmio64_allocators
-                };
+                let segment = pci_dev
+                    .id()
+                    .and_then(|id| self.device_tree.lock().unwrap().get(&id)?.pci_bdf)
+                    .ok_or_else(|| io::Error::other("failed finding PCI segment of device"))?
+                    .segment() as usize;
+                let mut mmio32 = self.pci_mmio32_allocators[segment].lock().unwrap();
+                let mut mmio64 = self.pci_mmio64_allocators[segment].lock().unwrap();
 
-                // Find the specific allocator that this BAR was allocated from and use it for a new one
-                for pci_mmio_allocator_mutex in pci_mmio_allocators {
-                    let mut pci_mmio_allocator = pci_mmio_allocator_mutex.lock().unwrap();
-
-                    if pci_mmio_allocator.contains(GuestAddress(old_base)) {
-                        // Free old_base first so allocate(new_base) sees it
-                        // as available; restore old_base on failure to keep
-                        // the allocator in sync with the MMIO bus.
-                        pci_mmio_allocator.free(GuestAddress(old_base), len as GuestUsize);
-                        if pci_mmio_allocator
-                            .allocate(Some(GuestAddress(new_base)), len as GuestUsize, Some(len))
-                            .is_none()
-                        {
-                            if pci_mmio_allocator
-                                .allocate(
-                                    Some(GuestAddress(old_base)),
-                                    len as GuestUsize,
-                                    Some(len),
-                                )
-                                .is_none()
-                            {
-                                error!(
-                                    "Failed to restore old MMIO range 0x{old_base:x} after rejected move_bar"
-                                );
-                            }
-                            return Err(io::Error::other("failed allocating new MMIO range"));
-                        }
-
-                        break;
-                    }
+                let old_addr = GuestAddress(old_base);
+                let new_addr = GuestAddress(new_base);
+                let is_64bit = region_type == PciBarRegionType::Memory64BitRegion;
+                let holds = |addr| mmio32.contains(addr) || (is_64bit && mmio64.contains(addr));
+                if !holds(old_addr) || !holds(new_addr) {
+                    return Err(io::Error::other("BAR address outside its MMIO windows"));
                 }
+
+                // Allocate before freeing so a refused move changes nothing.
+                let new_allocator = if mmio32.contains(new_addr) {
+                    &mut *mmio32
+                } else {
+                    &mut *mmio64
+                };
+                new_allocator
+                    .allocate(Some(new_addr), len as GuestUsize, Some(len))
+                    .ok_or_else(|| io::Error::other("failed allocating new MMIO range"))?;
+                let old_allocator = if mmio32.contains(old_addr) {
+                    &mut *mmio32
+                } else {
+                    &mut *mmio64
+                };
+                old_allocator.free(old_addr, len as GuestUsize);
+                drop((mmio32, mmio64));
 
                 // Update MMIO bus
                 self.mmio_bus
