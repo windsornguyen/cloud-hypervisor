@@ -14,14 +14,13 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use std::io::{self, Write};
 use std::ops::Deref;
 use std::os::unix::io::AsRawFd;
 use std::sync::atomic::AtomicBool;
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::{Arc, Barrier, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
-use std::{cmp, mem, result};
+use std::{cmp, io, mem, result};
 
 use anyhow::anyhow;
 use event_monitor::event;
@@ -940,35 +939,21 @@ impl VirtioDevice for Balloon {
     }
 
     fn write_config(&mut self, offset: u64, data: &[u8]) {
+        let len = data.len() as u64;
+        if !matches!(len, 1 | 2 | 4) || !offset.is_multiple_of(len) {
+            error!("Unsupported config write: offset {offset:x} length {len}");
+            return;
+        }
+
         // The "actual" field is the only mutable field
-        if offset != CONFIG_ACTUAL_OFFSET || data.len() != CONFIG_ACTUAL_SIZE {
-            error!(
-                "Attempt to write to read-only field: offset {:x} length {}",
-                offset,
-                data.len()
-            );
+        let actual = CONFIG_ACTUAL_OFFSET..CONFIG_ACTUAL_OFFSET + CONFIG_ACTUAL_SIZE as u64;
+        if offset < actual.start || offset + len > actual.end {
+            error!("Attempt to write to read-only field: offset {offset:x} length {len}");
             return;
         }
 
-        let config = self.config.as_mut_slice();
-        let config_len = config.len() as u64;
-        let data_len = data.len() as u64;
-        if offset + data_len > config_len {
-            error!(
-                "Out-of-bound access to configuration: config_len = {} offset = {:x} length = {} for {}",
-                config_len,
-                offset,
-                data_len,
-                self.device_type()
-            );
-            return;
-        }
-
-        if let Some(end) = offset.checked_add(config.len() as u64) {
-            let mut offset_config =
-                &mut config[offset as usize..cmp::min(end, config_len) as usize];
-            offset_config.write_all(data).unwrap();
-        }
+        let start = offset as usize;
+        self.config.as_mut_slice()[start..start + data.len()].copy_from_slice(data);
     }
 
     fn activate(&mut self, context: ActivationContext) -> ActivateResult {
@@ -1263,6 +1248,61 @@ mod tests {
             parse_balloon_stats(&data),
             Err(BalloonStatsError::InvalidBufferLength(11))
         ));
+    }
+
+    #[test]
+    fn config_write_actual_in_aligned_parts() {
+        const PAGES: u32 = 0x0001_2345;
+        for width in [1, 2, 4] {
+            let mut balloon = Balloon::new(
+                "balloon0".to_string(),
+                0,
+                false,
+                false,
+                false,
+                SeccompAction::Allow,
+                EventFd::new(EFD_NONBLOCK).unwrap(),
+                None,
+            )
+            .unwrap();
+            for (index, part) in PAGES.to_le_bytes().chunks(width).enumerate() {
+                balloon.write_config(CONFIG_ACTUAL_OFFSET + (index * width) as u64, part);
+            }
+            assert_eq!(
+                balloon.get_actual(),
+                u64::from(PAGES) << VIRTIO_BALLOON_PFN_SHIFT,
+                "{width} byte writes"
+            );
+        }
+    }
+
+    #[test]
+    fn config_write_refuses_other_writes() {
+        let mut balloon = Balloon::new(
+            "balloon0".to_string(),
+            0,
+            false,
+            false,
+            false,
+            SeccompAction::Allow,
+            EventFd::new(EFD_NONBLOCK).unwrap(),
+            None,
+        )
+        .unwrap();
+        let cases = [
+            ("num_pages", 0, 4),
+            ("empty", CONFIG_ACTUAL_OFFSET, 0),
+            ("3 bytes", CONFIG_ACTUAL_OFFSET, 3),
+            ("8 bytes", CONFIG_ACTUAL_OFFSET, 8),
+            ("unaligned", CONFIG_ACTUAL_OFFSET + 1, 2),
+            ("past actual", CONFIG_ACTUAL_OFFSET + 4, 4),
+        ];
+        for (case, offset, len) in cases {
+            balloon.write_config(offset, &vec![0xff; len]);
+            let mut config = [0u8; mem::size_of::<VirtioBalloonConfig>()];
+            balloon.read_config(0, &mut config);
+            assert_eq!(config, [0; mem::size_of::<VirtioBalloonConfig>()], "{case}");
+        }
     }
 
     #[test]
