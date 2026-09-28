@@ -1007,7 +1007,11 @@ impl VfioCommon {
                     // We need do some fixup to keep MMIO RW region and msix cap region page size
                     // aligned.
                     region_size = self.fixup_msix_region(bar_id, region_size);
-                    mmio64_allocator
+                    let allocator = match restored_bar_addr {
+                        Some(addr) if mmio32_allocator.contains(addr) => &mut *mmio32_allocator,
+                        _ => &mut *mmio64_allocator,
+                    };
+                    allocator
                         .allocate(
                             restored_bar_addr,
                             region_size,
@@ -1076,7 +1080,11 @@ impl VfioCommon {
                     mmio32_allocator.free(region.start, region.length);
                 }
                 PciBarRegionType::Memory64BitRegion => {
-                    mmio64_allocator.free(region.start, region.length);
+                    if mmio32_allocator.contains(region.start) {
+                        mmio32_allocator.free(region.start, region.length);
+                    } else {
+                        mmio64_allocator.free(region.start, region.length);
+                    }
                 }
             }
         }

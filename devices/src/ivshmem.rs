@@ -270,7 +270,11 @@ impl PciDevice for IvshmemDevice {
 
         // The data BAR maps the shared memory object
         let data_bar_size = self.region_size;
-        let data_bar_addr = mmio64_allocator
+        let allocator = match data_bar_addr {
+            Some(addr) if mmio32_allocator.contains(addr) => mmio32_allocator,
+            _ => mmio64_allocator,
+        };
+        let data_bar_addr = allocator
             .allocate(data_bar_addr, data_bar_size, None)
             .ok_or(PciDeviceError::IoAllocationFailed(data_bar_size))?;
         debug!("ivshmem data BAR address 0x{:x}", data_bar_addr.0);

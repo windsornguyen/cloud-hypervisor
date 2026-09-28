@@ -1069,7 +1069,11 @@ impl PciDevice for VirtioPciDevice {
             } else {
                 Some(VIRTIO_PCI_BAR_ALIGN)
             };
-            let addr = mmio64_allocator
+            let allocator = match settings_bar_addr {
+                Some(addr) if mmio32_allocator.contains(addr) => mmio32_allocator,
+                _ => mmio64_allocator,
+            };
+            let addr = allocator
                 .allocate(settings_bar_addr, CAPABILITY_BAR_SIZE, alignment)
                 .ok_or(PciDeviceError::IoAllocationFailed(CAPABILITY_BAR_SIZE))?;
             (addr, region_type)
@@ -1157,7 +1161,12 @@ impl PciDevice for VirtioPciDevice {
                     mmio32_allocator.free(GuestAddress(bar.addr()), bar.size());
                 }
                 PciBarRegionType::Memory64BitRegion => {
-                    mmio64_allocator.free(GuestAddress(bar.addr()), bar.size());
+                    let addr = GuestAddress(bar.addr());
+                    if mmio32_allocator.contains(addr) {
+                        mmio32_allocator.free(addr, bar.size());
+                    } else {
+                        mmio64_allocator.free(addr, bar.size());
+                    }
                 }
                 _ => error!("Unexpected PCI bar type"),
             }
