@@ -704,9 +704,7 @@ impl DeviceRelocation for AddressManager {
                 for pci_mmio_allocator_mutex in pci_mmio_allocators {
                     let mut pci_mmio_allocator = pci_mmio_allocator_mutex.lock().unwrap();
 
-                    if old_base >= pci_mmio_allocator.base().0
-                        && old_base <= pci_mmio_allocator.end().0
-                    {
+                    if pci_mmio_allocator.contains(GuestAddress(old_base)) {
                         // Free old_base first so allocate(new_base) sees it
                         // as available; restore old_base on failure to keep
                         // the allocator in sync with the MMIO bus.
